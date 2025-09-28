@@ -67,6 +67,9 @@ const DEFAULT_HOURS = ['10:00','11:00','12:00','13:00','14:00','15:00','16:00','
 const DATA_FILE  = __DIR__ . '/data.json';           // JSON fallback store
 const DB_FILE    = __DIR__ . '/schedule.db';         // SQLite file (auto)
 const CONTENT_FILE = __DIR__ . '/content.json';      // Editable content (nav labels, texts, photo)
+const SLOT_BLOCKED_SENTINEL = '__BLOCKED__';
+const SLOT_BLOCKED_LEGACY = 'Not available';
+const SLOT_BLOCKED_TEXT = 'Click to ask on WhatsApp for availability.';
 // Pushover (optional)
 define('ADMIN_PASSWORD_HASH', (string)env('ADMIN_PASSWORD_HASH', ''));
 define('PUSHOVER_USER', (string)env('PUSHOVER_USER', ''));
@@ -97,6 +100,73 @@ function norm_phone($p){ return preg_replace('/[^0-9+]/','', $p ?? ''); }
 function h($s){ return htmlspecialchars($s ?? '', ENT_QUOTES, 'UTF-8'); }
 function base_url(){ $proto = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http'; $host = $_SERVER['HTTP_HOST'] ?? 'localhost'; $path = strtok($_SERVER['REQUEST_URI'],'?'); return $proto.'://'.$host.$path; }
 function post($k,$d=''){ return $_POST[$k] ?? $d; }
+function slot_is_blocked_name($name){
+  $trim = trim((string)$name);
+  if ($trim === '') {
+    return false;
+  }
+  if ($trim === SLOT_BLOCKED_SENTINEL) {
+    return true;
+  }
+  return strcasecmp($trim, SLOT_BLOCKED_LEGACY) === 0;
+}
+function slot_is_blocked($row){ return slot_is_blocked_name($row['name'] ?? ''); }
+function slot_has_booking($row){
+  $name = trim((string)($row['name'] ?? ''));
+  if ($name === '') {
+    return false;
+  }
+  return !slot_is_blocked_name($name);
+}
+function slot_is_available($row){ return !slot_is_blocked($row) && !slot_has_booking($row); }
+function slot_pretty_labels($date,$hour){
+  $dt = DateTime::createFromFormat('Y-m-d', $date);
+  if (!$dt){ return ['', str_replace(':','.', $hour ?? '')]; }
+  $months = [1=>'Jan.',2=>'Feb.',3=>'Mar.',4=>'Apr.',5=>'May',6=>'Jun.',7=>'Jul.',8=>'Aug.',9=>'Sept.',10=>'Oct.',11=>'Nov.',12=>'Dec.'];
+  $monthLabel = $months[(int)$dt->format('n')] ?? $dt->format('M');
+  $dateLabel = $dt->format('j') . ' ' . $monthLabel . ' ' . $dt->format('D');
+  $timeLabel = str_replace(':','.', $hour ?? '');
+  return [$dateLabel, $timeLabel];
+}
+function slot_whatsapp_message($date,$hour){
+  [$dateLabel,$timeLabel] = slot_pretty_labels($date,$hour);
+  if ($dateLabel === '' || $timeLabel === ''){
+    return 'Hello, I want to ask if it is possible to get a session.';
+  }
+  return "Hello, I want to ask if it is possible to get a session on {$dateLabel} at {$timeLabel}";
+}
+function slot_whatsapp_link($phone,$date,$hour){
+  $target = norm_phone($phone);
+  if ($target === ''){
+    return '';
+  }
+  $target = ltrim($target, '+');
+  $msg = slot_whatsapp_message($date,$hour);
+  $encoded = rawurlencode($msg);
+  return 'https://wa.me/' . $target . '?text=' . $encoded;
+}
+function quick_date_label($dateStr,$lang)
+{
+  $target = DateTime::createFromFormat('Y-m-d', $dateStr);
+  if (!$target) {
+    return $dateStr;
+  }
+  $today = new DateTime(today_iso());
+  $diffDays = (int)$today->diff($target)->format('%r%a');
+  if ($lang === 'tr') {
+    if ($diffDays === 0) return 'Bugün';
+    if ($diffDays === 1) return 'Yarın';
+    $map = [
+      'Monday'=>'Pazartesi','Tuesday'=>'Salı','Wednesday'=>'Çarşamba','Thursday'=>'Perşembe',
+      'Friday'=>'Cuma','Saturday'=>'Cumartesi','Sunday'=>'Pazar'
+    ];
+    $weekday = $target->format('l');
+    return $map[$weekday] ?? $weekday;
+  }
+  if ($diffDays === 0) return 'Today';
+  if ($diffDays === 1) return 'Tomorrow';
+  return $target->format('l');
+}
 function default_busy_hours(){
   $out=[]; $t = DateTime::createFromFormat('H:i','10:00'); $end = DateTime::createFromFormat('H:i','20:00');
   while($t < $end){
@@ -142,8 +212,8 @@ class Store {
       $hoursNoon = gen_hours('12:00',60,15);
       $ins = $this->pdo->prepare('INSERT OR IGNORE INTO slots(date,hour,name,whatsapp) VALUES(?,?,"","")');
       foreach($hoursNoon as $h){ $ins->execute([$date,$h]); }
-      $blk = $this->pdo->prepare('UPDATE slots SET name="Not available" WHERE date=?');
-      $blk->execute([$date]);
+      $blk = $this->pdo->prepare('UPDATE slots SET name=?, whatsapp="" WHERE date=?');
+      $blk->execute([SLOT_BLOCKED_SENTINEL, $date]);
     }
     } else {
       $data = $this->readJson();
@@ -151,7 +221,7 @@ class Store {
         $data[$date] = [];
         $hoursNoon = gen_hours('12:00',60,15);
         foreach($hoursNoon as $h){
-          $data[$date][$h] = ["name"=>"Not available","whatsapp"=>""];
+          $data[$date][$h] = ["name"=>SLOT_BLOCKED_SENTINEL,"whatsapp"=>""];
         }
         $this->writeJson($data);
       }
@@ -189,17 +259,42 @@ class Store {
     $this->writeJson($data);
     return [true,null];
   }
-  public function adminUpdate($id,$name,$wa){ if ($this->useSqlite){ $u=$this->pdo->prepare('UPDATE slots SET name=?,whatsapp=? WHERE id=?'); $u->execute([$name,$wa,$id]); return true; } [$date,$hour]=explode('|',$id,2); $data=$this->readJson(); $data[$date][$hour]=['name'=>$name,'whatsapp'=>$wa]; $this->writeJson($data); return true; }
+  public function adminUpdate($id,$name,$wa,$blocked=false){
+    $name = (string)$name;
+    $wa = (string)$wa;
+    $blocked = (bool)$blocked;
+
+    if ($blocked && !slot_has_booking(['name'=>$name])){
+      $name = SLOT_BLOCKED_SENTINEL;
+      $wa = '';
+    } elseif (!$blocked && slot_is_blocked_name($name)) {
+      $name = '';
+    }
+
+    if ($this->useSqlite){
+      $u=$this->pdo->prepare('UPDATE slots SET name=?,whatsapp=? WHERE id=?');
+      $u->execute([$name,$wa,$id]);
+      return true;
+    }
+    [$date,$hour]=explode('|',$id,2);
+    $data=$this->readJson();
+    $data[$date][$hour]=['name'=>$name,'whatsapp'=>$wa];
+    $this->writeJson($data);
+    return true;
+  }
   public function adminDeleteHour($id){ if ($this->useSqlite){ $d=$this->pdo->prepare('DELETE FROM slots WHERE id=?'); $d->execute([$id]); return true; } [$date,$hour]=explode('|',$id,2); $data=$this->readJson(); unset($data[$date][$hour]); $this->writeJson($data); return true; }
   public function adminAddHour($date,$hour){ if ($this->useSqlite){ $i=$this->pdo->prepare('INSERT OR IGNORE INTO slots(date,hour,name,whatsapp) VALUES(?,?,"","")'); $i->execute([$date,$hour]); return true; } $data=$this->readJson(); if(!isset($data[$date])) $data[$date]=[]; if(!isset($data[$date][$hour])) $data[$date][$hour]=['name'=>'','whatsapp'=>'']; $this->writeJson($data); return true; }
-  public function replaceDayWithHours($date,$hours){
+  public function replaceDayWithHours($date,$hours,$blockAll=false){
     if ($this->useSqlite){
       $this->pdo->beginTransaction();
       try{
         $del = $this->pdo->prepare('DELETE FROM slots WHERE date=?');
         $del->execute([$date]);
-        $ins = $this->pdo->prepare('INSERT INTO slots(date,hour,name,whatsapp) VALUES(?,?,"","")');
-        foreach ($hours as $h){ $ins->execute([$date,$h]); }
+        $ins = $this->pdo->prepare('INSERT INTO slots(date,hour,name,whatsapp) VALUES(?,?,?,"")');
+        foreach ($hours as $h){
+          $name = $blockAll ? SLOT_BLOCKED_SENTINEL : '';
+          $ins->execute([$date,$h,$name]);
+        }
         $this->pdo->commit();
       } catch (Throwable $e){
         $this->pdo->rollBack();
@@ -208,7 +303,7 @@ class Store {
     } else {
       $data = $this->readJson();
       $data[$date] = [];
-      foreach($hours as $h){ $data[$date][$h] = ['name'=>'','whatsapp'=>'']; }
+      foreach($hours as $h){ $data[$date][$h] = ['name'=>$blockAll ? SLOT_BLOCKED_SENTINEL : '','whatsapp'=>'']; }
       $this->writeJson($data);
     }
     return true;
@@ -355,7 +450,14 @@ if (post('action')==='self_cancel'){
   exit;
 }
 if ($isAdminView && is_admin() && post('action')==='admin_update'){
-  header('Content-Type: application/json; charset=UTF-8'); $id=post('id'); $name=post('name'); $wa=norm_phone(post('whatsapp')); $store->adminUpdate($id,$name,$wa); echo json_encode(['ok'=>true]); exit;
+  header('Content-Type: application/json; charset=UTF-8');
+  $id=post('id');
+  $name=post('name');
+  $wa=norm_phone(post('whatsapp'));
+  $blockedFlag = post('blocked','0');
+  $blocked = in_array($blockedFlag, ['1','true','on'], true);
+  $store->adminUpdate($id,$name,$wa,$blocked);
+  echo json_encode(['ok'=>true]); exit;
 }
 if ($isAdminView && is_admin() && post('action')==='admin_delete'){
   header('Content-Type: application/json; charset=UTF-8'); $id=post('id'); $store->adminDeleteHour($id); echo json_encode(['ok'=>true]); exit;
@@ -394,12 +496,20 @@ if ($isAdminView && is_admin() && post('action')==='admin_apply_pattern'){
     return $out;
   };
 
-    $hours = ($pattern==='A') ? $build($start,60,15) : $build($start,90,15);
+  $blockAll = false;
+  if ($pattern==='A') {
+    $hours = $build($start,60,15);
+  } elseif ($pattern==='B') {
+    $hours = $build($start,90,15);
+  } else {
+    $hours = $build($start,60,15);
+    $blockAll = true;
+  }
   $hours = array_values(array_unique($hours));
   sort($hours, SORT_STRING);
 
   try {
-    $store->replaceDayWithHours($date, $hours);
+    $store->replaceDayWithHours($date, $hours, $blockAll);
     echo json_encode(['ok'=>true,'hours'=>$hours]);
   } catch (Throwable $e){
     http_response_code(500);
@@ -454,6 +564,39 @@ if (count($rows) >= 2) {
   }
 }
 
+$quickDates = [];
+$todayRef = new DateTime(today_iso());
+for ($i = 0; $i < 3; $i++) {
+  $quickDates[] = (clone $todayRef)->modify('+' . $i . ' day')->format('Y-m-d');
+}
+$bookingDates = [];
+foreach (array_merge([$date], $quickDates) as $candidate) {
+  if (!in_array($candidate, $bookingDates, true)) {
+    $bookingDates[] = $candidate;
+  }
+}
+$bookingDateLabels = [];
+$bookingHours = [];
+foreach ($bookingDates as $dCandidate) {
+  $store->ensureDay($dCandidate, default_busy_hours());
+  $dayRows = $store->getDay($dCandidate);
+  if (!is_array($dayRows)) { $dayRows = []; }
+  usort($dayRows, function($a,$b){ return strcmp($a['hour'],$b['hour']); });
+  $availHours = [];
+  foreach ($dayRows as $slotRow) {
+    if (slot_is_available($slotRow)) {
+      $availHours[] = $slotRow['hour'];
+    }
+  }
+  $bookingHours[$dCandidate] = array_values(array_unique($availHours));
+  $bookingDateLabels[$dCandidate] = quick_date_label($dCandidate, $lang);
+}
+$bookingData = [
+  'order' => $bookingDates,
+  'labels' => $bookingDateLabels,
+  'hours' => $bookingHours,
+];
+
 ?>
 <!doctype html>
 <html lang="en">
@@ -462,33 +605,66 @@ if (count($rows) >= 2) {
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title><?php echo h($titlesL['sessions']); ?><?php echo $isAdminView? ' – Admin':''; ?></title>
 <style>
-  :root{ --bg:#0b0c10; --card:#0f1117; --ink:#e6e6e6; --muted:#a6aabb; --line:#1f2533; --accentOld:#4f79ff; --accent:rgba(79, 121, 255, 0.66); --accent2:rgba(79, 121, 255, 0.32); --hdrH:16.66vh }
+  :root{ 
+    --bg: #0b0c10;
+    --hdrC: rgba(0, 0, 0, 0.32);
+    --hdrH: 16.66vh;
+
+    --accent: rgba(79, 121, 255, 0.66);
+    --accentb: rgba(79, 121, 255, 0.66);
+
+    --accent2: rgba(79, 121, 255, 0.32);
+    --accent2b: rgba(79, 121, 255, 0.32);
+
+    --warn: rgba(79, 121, 255, 0.32);
+    --warn2: rgba(79, 121, 255, 0.32);
+
+    --card: #0f1117;
+
+    --ink: #e6e6e6;
+    --muted: #a6aabb;
+
+    --line: #1f2533;
+   }
   *{box-sizing:border-box}
   html,body{height:100%}
   body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
   a{color:#9ab3ff;text-decoration:none}
   .wrap{max-width:920px;margin:0 auto;padding:0 16px}
-  .header{position:sticky;top:0;z-index:10;background:rgba(11,12,16,.8);backdrop-filter:saturate(140%) blur(8px);}
+  .header{position:sticky;top:0;z-index:10;background:var(--hdrC);backdrop-filter:saturate(140%) blur(8px);}
   :root { --hdrH: 16.66vh; }               /* header yüksekliği değişkeni */
   .bar{display:grid;grid-template-columns:1fr auto;align-items:center;min-height:16.66vh;padding:8px 0}
   .profile{display:flex;align-items:center;gap:12px}
   .pfp{border-radius:12px;object-fit:cover}
-  .nav{display:flex;gap:10px;flex-wrap:wrap;justify-content:flex-end}
-  .nav a:not(.btn){padding:8px 10px;border-radius:999px;background:#1a1d27}
+  .nav{display:flex;gap:7px;flex-wrap:wrap;justify-content:flex-end}
+  .nav a:not(.btn){padding:8px;border-radius:999px;background:#1a1d27}
   .section{padding:18px 0;scroll-margin-top: calc(var(--hdrH) + 12px);}
   .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px}
   .row{display:grid;grid-template-columns:110px 1fr;gap:10px;align-items:center;padding:8px 10px;border-radius:10px;background:#111319;margin-bottom:6px}
   .hour{font-weight:600}
   .name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .btn{appearance:none;border:none;border-radius:8px;padding:8px 12px;font-weight:600;cursor:pointer}
-  .btn.primary{background:var(--accent);color:#fff}
+
+  .btn{appearance:none;border:none;border-radius:8px;padding:8px 11px;cursor:pointer;font-size: 15px;}
+
+  .btn.primary{background:var(--accent);color:#fff;}
+  .btn.ghost,   .nav .btn.primary, .nav .btn.ghost{background:#1a1d27;color:var(--ink)}
+
+
+
+
+ 
+
+  
+  .nav .btn.primary:first-child, .nav .btn.ghost:first-child{color: #ffffcc;background-color: #ff3300;font-weight:600;}
+  
+
   .btn.secondary{background:var(--accent2);color:#fff}
-  .btn.ghost{background:#1a1d27;color:var(--ink)}
   .btn.danger{background:rgba(185, 75, 75, 0.58);color:#fff}
 
   /* Segmented date buttons & safety guards */
   .seg{ display:flex; gap:6px; flex-wrap:wrap; justify-content:center; width:100%; position:relative; }
-  .seg .btn{ display:inline-flex; align-items:center; justify-content:center; }
+  .seg .btn, .seg .btn.primary{ background:#1a1d27;color:#9d9d9d;}
+ .seg .btn.primary{ text-decoration:underline;color:var(--ink)}
   .seg a{ flex: 0 0 auto; }
  
   .tabbtn{width: 48%; text-align: center}
@@ -505,13 +681,22 @@ margin: 11px 0px 6px 7px;}
     font-size:16px;         /* iOS zoom fix */
     line-height:1.3;
   }
-  select,button{ font-size:16px }  /* iOS zoom fix (dialog butonları vs.) */
+  input.check{width:unset;}
+  select,button{ width:100%;
+    padding:10px 12px;
+    border-radius:10px;
+    border:1px solid #2a2f3d;
+    background:#0f1117;
+    color:var(--ink);
+    font-size:16px;
+    line-height:1.3; }  
+
   textarea{min-height:140px}
   .grid1{display:grid;grid-template-columns:1fr;gap:8px}
   .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
   .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px}
   .muted{color:var(--muted)}
-  .pill{background:#1a1d27;padding:4px 8px;border-radius:999px;font-size:11px}
+  .pill{background:#1a1d27;padding:4px 8px;border-radius:999px;font-size:11px;font-weight: bold;}
   .badge-available{background:#12351f;color:#7fdb9b;padding:4px 8px;border-radius:999px;font-size:11px;font-weight:600}
   .badge-booked{background:#36161a;color:#ff9aa2;padding:4px 8px;border-radius:999px;font-size:11px;font-weight:700}
   .empty{opacity:.7}
@@ -543,20 +728,22 @@ margin: 11px 0px 6px 7px;}
         <img class="pfp" src="<?php echo h($content['profilePhotoUrl']); ?>" alt="profile" id="pfp" style="width:<?php echo (int)($content['pfp_w'] ?? 96); ?>px;height:<?php echo (int)($content['pfp_h'] ?? 96); ?>px" />
       </div>
       <nav class="nav"> 
+        
         <a href="#schedule" id="navBook" class="btn ghost"><?php echo h($navL['book']); ?></a>
         <a href="#sessions" id="navSessions" class="btn ghost"><?php echo h($navL['sessions']); ?></a>
         <a href="#about"    id="navAbout"  class="btn ghost"><?php echo h($navL['about']); ?></a>
         <?php if (!empty($content['wa'])): ?>
-          <a href="https://wa.me/<?php echo h(preg_replace('/[^0-9]/','',$content['wa'])); ?>" target="_blank"><?php echo h($content['waLabel'] ?? 'WhatsApp'); ?></a>
+          <a href="https://wa.me/<?php echo h(preg_replace('/[^0-9]/','',$content['wa'])); ?>" target="_blank" class="pill"
+           style="display:inline-flex;align-items:center;justify-content:center;"><?php echo h($content['waLabel'] ?? 'WhatsApp'); ?></a>
         <?php endif; ?>
           
         <a href="https://www.instagram.com/bedenine.odaklan" target="_blank" class="pill"
-           style="display:inline-flex;align-items:center;justify-content:center;min-width:36px;">
+           style="display:inline-flex;align-items:center;justify-content:center;">
           Instagram
         </a>
           
         <?php $to = ($lang==='tr'?'en':'tr'); $lab = strtoupper($to); ?>
-        <a href="<?php echo h(lang_toggle_href($to)); ?>" title="Change language" class="pill" style="display:inline-flex;align-items:center;justify-content:center;min-width:36px;text-transform:uppercase"><?php echo h($lab); ?></a>
+        <a href="<?php echo h(lang_toggle_href($to)); ?>" title="Change language" class="pill" style="display:inline-flex;align-items:center;justify-content:center;text-transform:uppercase"><?php echo h($lab); ?></a>
       </nav>
     </div>
   </div>
@@ -575,18 +762,11 @@ margin: 11px 0px 6px 7px;}
       </div>
     <?php else: ?>
       <?php
-        $t0 = new DateTime(today_iso());
-        $t1 = (clone $t0)->modify('+1 day');
-        $t2 = (clone $t0)->modify('+2 days');
-        $lab0 = ($lang==='tr') ? 'Bugün' : 'Today';
-        $lab1 = ($lang==='tr') ? 'Yarın' : 'Tomorrow';
-        $trDays = ['Monday'=>'Pazartesi','Tuesday'=>'Salı','Wednesday'=>'Çarşamba','Thursday'=>'Perşembe','Friday'=>'Cuma','Saturday'=>'Cumartesi','Sunday'=>'Pazar'];
-        $dayEn = $t2->format('l');
-        $lab2 = ($lang==='tr') ? ($trDays[$dayEn] ?? $dayEn) : $dayEn; // Friday or Cuma
-        $d0 = $t0->format('Y-m-d'); $d1 = $t1->format('Y-m-d'); $d2 = $t2->format('Y-m-d');
-        $is0 = ($date === $d0); $is1 = ($date === $d1); $is2 = ($date === $d2);
+        $segBtns = [];
+        foreach ($quickDates as $qd) {
+          $segBtns[] = [$qd, quick_date_label($qd, $lang), $date === $qd];
+        }
       ?>
-      <?php $segBtns = [ [$d0,$lab0,$is0], [$d1,$lab1,$is1], [$d2,$lab2,$is2] ]; ?>
       <div class="seg" role="tablist" aria-label="Choose day">
         <?php foreach($segBtns as [$d,$lab,$active]): $cls = $active ? 'primary' : 'ghost'; ?>
           <a class="btn <?php echo $cls; ?>" href="?date=<?php echo h($d); ?>"><?php echo h($lab); ?></a>
@@ -605,25 +785,34 @@ margin: 11px 0px 6px 7px;}
     </div>
       
     <div id="list">
-      <?php foreach($rows as $r): 
-            $wa = $r['whatsapp'] ?? ''; 
-            $waLink = $wa ? 'https://wa.me/'.preg_replace('/[^0-9]/','',$wa) : ''; ?>
-        <div class="row"
-            <?php if(!$isAdminView): ?>
-              <?php if(empty($r['name'])): ?>
-                data-book-hour="<?php echo h($r['hour']); ?>" style="cursor:pointer"
-              <?php else: ?>
-                data-cancel-hour="<?php echo h($r['hour']); ?>" style="cursor:pointer"
-              <?php endif; ?>
-            <?php endif; ?>>
-          <?php 
+      <?php foreach($rows as $r):
+            $hasBooking = slot_has_booking($r);
+            $isBlocked = slot_is_blocked($r);
+            $isAvailable = !$hasBooking && !$isBlocked;
             $startDT = DateTime::createFromFormat('H:i',$r['hour']);
             $endStr = $startDT ? (clone $startDT)->modify('+' . (int)$sessLen . ' minutes')->format('H:i') : $r['hour'];
-          ?>
+            $ownerWa = $content['wa'] ?? '';
+            $rowDate = $r['date'] ?? $date;
+            $blockedLink = $isBlocked ? slot_whatsapp_link($ownerWa, $rowDate, $r['hour']) : '';
+      ?>
+        <div class="row" data-slot-date="<?php echo h($rowDate); ?>"
+            <?php if(!$isAdminView): ?>
+              <?php if($hasBooking): ?>
+                data-cancel-hour="<?php echo h($r['hour']); ?>" data-cancel-date="<?php echo h($rowDate); ?>" style="cursor:pointer"
+              <?php elseif($isAvailable): ?>
+                data-book-hour="<?php echo h($r['hour']); ?>" data-book-date="<?php echo h($rowDate); ?>" style="cursor:pointer"
+              <?php endif; ?>
+            <?php endif; ?>>
           <div class="hour"><?php echo h($r['hour'].' – '.$endStr); ?></div>
           <div class="name">
-            <?php if(!empty($r['name'])): ?>
+            <?php if($hasBooking): ?>
               <span class="badge-booked"><?php echo h($r['name']); ?></span>
+            <?php elseif($isBlocked): ?>
+              <?php if($blockedLink): ?>
+                <a class="badge-available" href="<?php echo h($blockedLink); ?>" target="_blank" rel="noopener"><?php echo h(SLOT_BLOCKED_TEXT); ?></a>
+              <?php else: ?>
+                <span class="badge-available"><?php echo h(SLOT_BLOCKED_TEXT); ?></span>
+              <?php endif; ?>
             <?php else: ?>
               <span class="badge-available">Add your name</span>
             <?php endif; ?>
@@ -670,8 +859,19 @@ margin: 11px 0px 6px 7px;}
   <form method="dialog">
     <div class="dlg" style="padding:16px;background:#0f1117;border-radius:16px">
       <h3 style="margin:0 0 8px">Book a slot</h3>
-      <div class="grid2">
-        <div><label>Hour</label><input id="inpHour" disabled /></div>
+      <div class="grid2" style="margin-top:8px">
+        <div>
+          <label>Date *</label>
+          <select id="selDate">
+            <option value="" selected disabled>Select date</option>
+          </select>
+        </div>
+        <div>
+          <label>Hour *</label>
+          <select id="selHour" disabled>
+            <option value="" selected disabled>Select time</option>
+          </select>
+        </div>
       </div>
       <div class="grid2" style="margin-top:8px">
         <div><label>First name *</label><input id="inpFirst" placeholder="First name" /></div>
@@ -741,6 +941,7 @@ margin: 11px 0px 6px 7px;}
                 <select id="patternSel" style="padding: 10px 12px;border-radius: 10px;border: 1px solid #2a2f3d;background: #0f1117;color: var(--ink);font-size: 16px;line-height: 1.3;height: 38px;">
                   <option value="A">Busy day (60m + 15m break)</option>
                   <option value="B">Easy day (90m + 15m break)</option>
+                  <option value="NA">Not available (block all slots)</option>
                 </select>
               </div>
               <div>
@@ -828,9 +1029,128 @@ margin: 11px 0px 6px 7px;}
 <script>
   const $ = (s)=>document.querySelector(s);
   const date = '<?php echo h($date); ?>';
+  const bookingData = <?php echo json_encode($bookingData, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP); ?>;
+  const bookingOrder = Array.isArray(bookingData.order) ? bookingData.order : [];
+  const bookingLabels = bookingData.labels || {};
+  const bookingHours = bookingData.hours || {};
+  const bookingTexts = <?php echo json_encode([
+    'selectDate' => ($lang==='tr') ? 'Tarih seç' : 'Select date',
+    'selectTime' => ($lang==='tr') ? 'Saat seç' : 'Select time',
+    'selectDateFirst' => ($lang==='tr') ? 'Önce tarih seç' : 'Select date first',
+    'noAvailability' => ($lang==='tr') ? 'Müsait zaman yok' : 'No availability',
+    'fullSuffix' => ($lang==='tr') ? '(dolu)' : '(full)'
+  ], JSON_UNESCAPED_UNICODE | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_HEX_AMP); ?>;
   const list = $('#list');
   const datePick = $('#datePick');
   const toTop = $('#toTop');
+  const bookDlg = document.getElementById('bookDlg');
+  const selDate = document.getElementById('selDate');
+  const selHour = document.getElementById('selHour');
+
+  function resetBookingFormFields(){
+    ['#inpFirst','#inpLast','#inpWA'].forEach(sel=>{
+      const field = document.querySelector(sel);
+      if (field) field.value = '';
+    });
+  }
+
+  function renderDateOptions(selectedDate){
+    if (!selDate) return '';
+    selDate.innerHTML = '';
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.disabled = true;
+    if (!selectedDate) {
+      placeholder.selected = true;
+    }
+    placeholder.textContent = bookingTexts.selectDate;
+    selDate.appendChild(placeholder);
+    let matched = '';
+    bookingOrder.forEach(dateValue => {
+      const opt = document.createElement('option');
+      opt.value = dateValue;
+      const hoursForDate = bookingHours[dateValue] || [];
+      opt.textContent = hoursForDate.length ? (bookingLabels[dateValue] || dateValue) : ((bookingLabels[dateValue] || dateValue) + ' ' + bookingTexts.fullSuffix);
+      if (!hoursForDate.length) {
+        opt.disabled = true;
+      }
+      if (selectedDate && dateValue === selectedDate) {
+        opt.selected = true;
+        matched = dateValue;
+      }
+      selDate.appendChild(opt);
+    });
+    if (selectedDate && !matched) {
+      const opt = document.createElement('option');
+      opt.value = selectedDate;
+      opt.textContent = bookingLabels[selectedDate] || selectedDate;
+      opt.selected = true;
+      selDate.appendChild(opt);
+      matched = selectedDate;
+    }
+    if (!selectedDate) {
+      selDate.value = '';
+    }
+    return matched;
+  }
+
+  function renderHourOptions(dateValue, selectedHour){
+    if (!selHour) return '';
+    selHour.innerHTML = '';
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.disabled = true;
+    selHour.appendChild(placeholder);
+    if (!dateValue) {
+      placeholder.textContent = bookingTexts.selectDateFirst;
+      placeholder.selected = true;
+      selHour.disabled = true;
+      return '';
+    }
+    const hours = bookingHours[dateValue] || [];
+    if (!hours.length) {
+      placeholder.textContent = bookingTexts.noAvailability;
+      placeholder.selected = true;
+      selHour.disabled = true;
+      return '';
+    }
+    placeholder.textContent = bookingTexts.selectTime;
+    placeholder.selected = !selectedHour;
+    selHour.disabled = false;
+    let matched = '';
+    hours.forEach(hour => {
+      const opt = document.createElement('option');
+      opt.value = hour;
+      opt.textContent = hour;
+      if (selectedHour && hour === selectedHour) {
+        opt.selected = true;
+        matched = hour;
+      }
+      selHour.appendChild(opt);
+    });
+    if (!matched) {
+      selHour.value = '';
+    }
+    return matched;
+  }
+
+  function openBookingDialog(prefDate = '', prefHour = ''){
+    if (!bookDlg) return;
+    const appliedDate = renderDateOptions(prefDate);
+    const targetDate = prefDate || appliedDate;
+    if (targetDate) {
+      renderHourOptions(targetDate, prefHour);
+      if (selDate && prefDate) {
+        selDate.value = prefDate;
+      }
+    } else {
+      renderHourOptions('', '');
+    }
+    resetBookingFormFields();
+    setTimeout(()=>{ document.getElementById('inpFirst')?.focus(); }, 40);
+    validateForm();
+    bookDlg.showModal();
+  }
   
   const header = document.querySelector('.header');
   document.querySelectorAll('.nav a').forEach(a=>{
@@ -843,8 +1163,21 @@ margin: 11px 0px 6px 7px;}
         if (!target) return;
         const y = target.getBoundingClientRect().top + window.scrollY - header.offsetHeight - 12;
         window.scrollTo({ top: y, behavior: 'smooth' });
+        if (a.id === 'navBook') {
+          openBookingDialog('','');
+        }
       }
     });
+  });
+
+  selDate?.addEventListener('change', ()=>{
+    const picked = selDate.value;
+    renderHourOptions(picked, '');
+    validateForm();
+  });
+
+  selHour?.addEventListener('change', ()=>{
+    validateForm();
   });
     
   // --- ScrollSpy: aktif bölüm mavi (btn primary), diğerleri ghost ---
@@ -909,12 +1242,8 @@ margin: 11px 0px 6px 7px;}
       const bookH = target.getAttribute('data-book-hour');
       const cancH = target.getAttribute('data-cancel-hour');
       if (bookH) {
-        $('#inpHour').value = bookH;
-        $('#inpFirst').value = '';
-        $('#inpLast').value  = '';
-        $('#inpWA').value    = '';
-        $('#btnBook').disabled = true;
-        $('#bookDlg').showModal();
+        const bookD = target.getAttribute('data-book-date') || target.getAttribute('data-slot-date') || date;
+        openBookingDialog(bookD, bookH);
       } else if (cancH) {
         $('#cancHour').value = cancH;
         $('#cancWA').value = '';
@@ -928,7 +1257,9 @@ margin: 11px 0px 6px 7px;}
     const fn = ($('#inpFirst')?.value||'').trim();
     const ln = ($('#inpLast')?.value||'').trim();
     const wa = ($('#inpWA')?.value||'').trim();
-    const ok = fn.length>0 && ln.length>0 && wa.length>=8;
+    const dateVal = selDate ? selDate.value : '';
+    const hourVal = selHour ? selHour.value : '';
+    const ok = fn.length>0 && ln.length>0 && wa.length>=8 && dateVal !== '' && hourVal !== '';
     const btn = $('#btnBook'); if(btn) btn.disabled = !ok;
   }
   ['#inpFirst','#inpLast','#inpWA'].forEach(sel=>{
@@ -973,15 +1304,19 @@ margin: 11px 0px 6px 7px;}
   const btn = document.getElementById('btnBook');
   const oldLabel = btn.textContent; btn.textContent = 'Saving…'; btn.disabled = true;
 
-  const hour=$('#inpHour').value;
+  const selectedDate = selDate ? selDate.value : '';
+  const selectedHour = selHour ? selHour.value : '';
   const fn=($('#inpFirst')?.value||'').trim();
   const ln=($('#inpLast')?.value||'').trim();
   const wa=($('#inpWA')?.value||'').trim();
-  if(!fn||!ln||wa.length<8){ btn.textContent = oldLabel; btn.disabled = false; return; }
+  if(!fn||!ln||wa.length<8||!selectedDate||!selectedHour){ btn.textContent = oldLabel; btn.disabled = false; return; }
   const name = fn + ' ' + ln;
   const form = new FormData();
-  form.append('action','book'); form.append('date',date);
-  form.append('hour',hour); form.append('name',name); form.append('whatsapp',wa);
+  form.append('action','book');
+  form.append('date',selectedDate);
+  form.append('hour',selectedHour);
+  form.append('name',name);
+  form.append('whatsapp',wa);
   try{
     const res = await fetch(location.href, { method:'POST', body:form });
     const out = await res.json();
@@ -1021,15 +1356,28 @@ margin: 11px 0px 6px 7px;}
       (function(){
         const adminList=document.getElementById('adminList');
         const rows = <?php echo json_encode($rows ?? []); ?>;
+        const BLOCK_SENTINEL = '<?php echo addslashes(SLOT_BLOCKED_SENTINEL); ?>';
+        const BLOCK_LEGACY = '<?php echo addslashes(SLOT_BLOCKED_LEGACY); ?>'.toLowerCase();
         adminList.innerHTML='';
         rows.forEach(r=>{
+          const originalName = (r.name||'').trim();
+          const isBlocked = originalName === BLOCK_SENTINEL || originalName.toLowerCase() === BLOCK_LEGACY;
+          const isBooked = !isBlocked && originalName.length>0;
+          const displayName = isBlocked ? '' : (r.name||'');
+          const displayWa = isBlocked ? '' : (r.whatsapp||'');
+          const checkboxState = [];
+          if (isBlocked) { checkboxState.push('checked'); }
+          if (isBooked) { checkboxState.push('checked','disabled'); }
           const div=document.createElement('div'); div.className='row';
           div.innerHTML=`<div class="hour">${r.hour}</div>
             <div>
               <div class="grid2">
-                <input required value="${r.name||''}" data-id="${r.id}" data-f="name" placeholder="Name" />
-                <input required value="${r.whatsapp||''}" data-id="${r.id}" data-f="whatsapp" placeholder="Phone Nr +90..." />
+                <input required value="${displayName}" data-id="${r.id}" data-f="name" placeholder="Name" />
+                <input required value="${displayWa}" data-id="${r.id}" data-f="whatsapp" placeholder="Phone Nr +90..." />
               </div>
+              <label style="display:flex;align-items:center;gap:6px;margin-top:8px;font-size:14px;color:var(--muted);">
+                <input class="check" type="checkbox" data-id="${r.id}" data-f="blocked" ${checkboxState.join(' ')} /> Not available
+              </label>
               <div style="margin-top:8px;display:flex;gap:8px">
                 <button class="btn secondary" data-id="${r.id}" data-act="save">Save</button>
                 <button class="btn ghost" data-id="${r.id}" data-act="clear">Clear</button>
@@ -1041,8 +1389,16 @@ margin: 11px 0px 6px 7px;}
         document.addEventListener('click', async (e)=>{
           const act=e.target.getAttribute('data-act'); if(!act) return; const id=e.target.getAttribute('data-id');
           let form=new FormData(); form.append('date',date);
-          if(act==='save'){ const name=document.querySelector(`input[data-id="${id}"][data-f="name"]`).value; const wa=document.querySelector(`input[data-id="${id}"][data-f="whatsapp"]`).value; form.append('action','admin_update'); form.append('id',id); form.append('name',name); form.append('whatsapp',wa); }
-          if(act==='clear'){ form.append('action','admin_update'); form.append('id',id); form.append('name',''); form.append('whatsapp',''); }
+          const blockedEl = document.querySelector(`input[data-id="${id}"][data-f="blocked"]`);
+          const blockedVal = (blockedEl && !blockedEl.disabled && blockedEl.checked) ? '1' : '0';
+          if(act==='save'){
+            const name=document.querySelector(`input[data-id="${id}"][data-f="name"]`).value;
+            const wa=document.querySelector(`input[data-id="${id}"][data-f="whatsapp"]`).value;
+            form.append('action','admin_update'); form.append('id',id); form.append('name',name); form.append('whatsapp',wa); form.append('blocked',blockedVal);
+          }
+          if(act==='clear'){
+            form.append('action','admin_update'); form.append('id',id); form.append('name',''); form.append('whatsapp',''); form.append('blocked','0');
+          }
           if(act==='delete'){ if(!confirm('Delete this hour?')) return; form.append('action','admin_delete'); form.append('id',id); }
           const res=await fetch(location.href,{method:'POST',body:form}); const o=await res.json(); if(o.ok) location.reload(); else alert(o.error||'Error');
         });
